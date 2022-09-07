@@ -87,6 +87,7 @@ int main(int argc, char **argv)
         GLsync sync = 0;
     };
     std::vector<TextureBuffer> buffers;
+    bool buffersReady = false;
     const uint32_t texturesCount = 10;
     const uint32_t texWidth = 1920;
     const uint32_t texHeight = 1080;
@@ -96,43 +97,18 @@ int main(int argc, char **argv)
 
     std::thread thread([window, parallelContext, &finished, &mutex, &cond, &parallelMadeCurrent,
                         texWidth, texHeight, texturesCount, &buffers, &writeIndex, &readIndex,
-                        &glSync]() {
+                        &glSync, &buffersReady]() {
         {
             std::lock_guard guard(mutex);
             SDL_GL_MakeCurrent(window, parallelContext);
-
-            for (uint32_t i = 0; i < texturesCount; ++i) {
-                TextureBuffer buffer;
-
-                glGenTextures(1, &buffer.texture);
-                if (!buffer.texture) {
-                    printf("glGenTextures failed\n");
-                    exit(1);
-                }
-                glBindTexture(GL_TEXTURE_2D, buffer.texture);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, texWidth, texHeight, 0, GL_RGBA,
-                             GL_UNSIGNED_BYTE, 0);
-                glBindTexture(GL_TEXTURE_2D, 0);
-
-                glGenBuffers(1, &buffer.pbo);
-                if (!buffer.pbo) {
-                    printf("glGenBuffers failed\n");
-                    exit(1);
-                }
-                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffer.pbo);
-                glBufferData(GL_PIXEL_UNPACK_BUFFER, texWidth * texHeight * 4, NULL,
-                             GL_STREAM_DRAW);
-                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-                CHECK_GL_ERROR;
-
-                buffers.push_back(buffer);
-            }
-
             parallelMadeCurrent = true;
             cond.notify_all();
+        }
+        {
+            std::unique_lock lock(mutex);
+            while (!buffersReady) {
+                cond.wait(lock);
+            }
         }
         const uint32_t channels = 4;
         const uint32_t dataSize = texWidth * texHeight * channels;
@@ -196,6 +172,41 @@ int main(int argc, char **argv)
         while (!parallelMadeCurrent) {
             cond.wait(lock);
         }
+    }
+
+    for (uint32_t i = 0; i < texturesCount; ++i) {
+        TextureBuffer buffer;
+
+        glGenTextures(1, &buffer.texture);
+        if (!buffer.texture) {
+            printf("glGenTextures failed\n");
+            exit(1);
+        }
+        glBindTexture(GL_TEXTURE_2D, buffer.texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, texWidth, texHeight, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, 0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        glGenBuffers(1, &buffer.pbo);
+        if (!buffer.pbo) {
+            printf("glGenBuffers failed\n");
+            exit(1);
+        }
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffer.pbo);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, texWidth * texHeight * 4, NULL,
+                     GL_STREAM_DRAW);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+        CHECK_GL_ERROR;
+
+        buffers.push_back(buffer);
+    }
+    {
+        std::lock_guard guard(mutex);
+        buffersReady = true;
+        cond.notify_all();
     }
 
     glDisable(GL_DEPTH_TEST);
