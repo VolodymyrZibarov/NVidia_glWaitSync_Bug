@@ -24,7 +24,7 @@ int main(int argc, char **argv)
     printf("Started\n");
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         printf("SDL_Init failed: %s", SDL_GetError());
-        return 1;
+        exit(1);
     }
     printf("SDL inited\n");
 
@@ -43,7 +43,7 @@ int main(int argc, char **argv)
     SDL_DisplayMode displayMode;
     if (SDL_GetDesktopDisplayMode(0, &displayMode) != 0) {
         printf("SDL_GetDesktopDisplayMode failed\n");
-        return 1;
+        exit(1);
     }
     printf("Desktop display mode: %i x %i @ %i\n", displayMode.w, displayMode.h,
            displayMode.refresh_rate);
@@ -54,7 +54,7 @@ int main(int argc, char **argv)
     auto *window = SDL_CreateWindow("Screenberry", 0, 0, displayMode.w, displayMode.h, windowFlags);
     if (!window) {
         printf("SDL_CreateWindow failed");
-        return 1;
+        exit(1);
     }
     printf("Window created\n");
 
@@ -64,17 +64,17 @@ int main(int argc, char **argv)
     SDL_GLContext mainContext = SDL_GL_CreateContext(window);
     if (!parallelContext || !mainContext) {
         printf("SDL_GL_CreateContext failed\n");
-        return 1;
+        exit(1);
     }
 
     if (SDL_GL_SetSwapInterval(1) != 0) {
         printf("SDL_GL_SetSwapInterval failed");
-        return 1;
+        exit(1);
     }
 
     if (!gladLoadGL((GLADloadfunc)SDL_GL_GetProcAddress)) {
         printf("gladLoadGL failed\n");
-        return 1;
+        exit(1);
     }
     std::mutex mutex;
     std::condition_variable cond;
@@ -82,11 +82,12 @@ int main(int argc, char **argv)
     std::atomic_bool finished = false;
     struct TextureBuffer
     {
+        GLuint pbo = 0;
         GLuint texture = 0;
         GLsync sync = 0;
     };
     std::vector<TextureBuffer> buffers;
-    const uint32_t texturesCount = 5;
+    const uint32_t texturesCount = 10;
     const uint32_t texWidth = 1920;
     const uint32_t texHeight = 1080;
     uint32_t readIndex = 0;
@@ -102,14 +103,31 @@ int main(int argc, char **argv)
 
             for (uint32_t i = 0; i < texturesCount; ++i) {
                 TextureBuffer buffer;
+
                 glGenTextures(1, &buffer.texture);
+                if (!buffer.texture) {
+                    printf("glGenTextures failed\n");
+                    exit(1);
+                }
                 glBindTexture(GL_TEXTURE_2D, buffer.texture);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, texWidth, texHeight, 0, GL_RGBA,
                              GL_UNSIGNED_BYTE, 0);
+                glBindTexture(GL_TEXTURE_2D, 0);
+
+                glGenBuffers(1, &buffer.pbo);
+                if (!buffer.pbo) {
+                    printf("glGenBuffers failed\n");
+                    exit(1);
+                }
+                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffer.pbo);
+                glBufferData(GL_PIXEL_UNPACK_BUFFER, texWidth * texHeight * 4, NULL,
+                             GL_STREAM_DRAW);
+                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+                CHECK_GL_ERROR;
+
                 buffers.push_back(buffer);
             }
 
@@ -138,21 +156,38 @@ int main(int argc, char **argv)
             {
                 std::unique_lock lock(mutex);
                 while (!finished && writeIndex != readIndex) {
+                    printf("waiting to write...\n");
                     cond.wait(lock);
                 }
             }
+            printf("writing: %i\n", writeIndex);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffers[writeIndex].pbo);
+            auto mappedPtr = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, dataSize, GL_MAP_WRITE_BIT);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+            std::memcpy(mappedPtr, data.get(), dataSize);
+
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffers[writeIndex].pbo);
+            glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
             glBindTexture(GL_TEXTURE_2D, buffers[writeIndex].texture);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffers[writeIndex].pbo);
             glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, texWidth, texHeight, GL_RGBA, GL_UNSIGNED_BYTE,
-                            (const GLvoid *)data.get());
-            CHECK_GL_ERROR;
+                            0);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+            glBindTexture(GL_TEXTURE_2D, 0);
+
             buffers[writeIndex].sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
             glFlush();
+
             {
                 std::lock_guard guard(mutex);
                 writeIndex = (writeIndex + 1) % texturesCount;
                 cond.notify_all();
             }
+
             offset = (offset + step) % barPeriod;
         }
     });
@@ -190,14 +225,33 @@ int main(int argc, char **argv)
             }
 
             {
+                std::lock_guard guard(mutex);
+                if (readIndex != writeIndex) {
+                    readIndex = (readIndex + 1) % texturesCount;
+                    cond.notify_all();
+                }
+                if (readIndex != writeIndex) {
+                    printf("Invalid state\n");
+                    exit(1);
+                }
+            }
+
+            {
                 std::unique_lock lock(mutex);
                 while (writeIndex == readIndex) {
+                    printf("waiting to read...\n");
                     cond.wait(lock);
                 }
+            }
+            if (!buffers[readIndex].sync) {
+                printf("Error: No sync\n");
+                exit(1);
             }
             glWaitSync(buffers[readIndex].sync, 0, GL_TIMEOUT_IGNORED);
             glDeleteSync(buffers[readIndex].sync);
             buffers[readIndex].sync = nullptr;
+
+            printf("reading %i\n", readIndex);
 
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
@@ -224,15 +278,8 @@ int main(int argc, char **argv)
                 }
             }
 
-            CHECK_GL_ERROR;
-
             SDL_GL_SwapWindow(window);
-
-            {
-                std::lock_guard guard(mutex);
-                readIndex = (readIndex + 1) % texturesCount;
-                cond.notify_all();
-            }
+            CHECK_GL_ERROR;
 
             frame++;
         }

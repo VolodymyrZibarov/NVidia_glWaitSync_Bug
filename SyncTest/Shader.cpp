@@ -122,6 +122,8 @@ void Shader::render(GLuint textureId)
 
     glDrawArrays(GL_TRIANGLE_STRIP, 0, mVertsCount);
 
+    glBindTexture(GL_TEXTURE_2D, 0);
+
     glUseProgram(0);
     glBindVertexArray(0);
 }
