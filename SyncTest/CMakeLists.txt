@@ -1,7 +1,6 @@
-project(SyncTest)
+project(OpenGlMapTest)
 add_executable(${PROJECT_NAME}
     main.cpp
-    Shader.cpp Shader.h
     )
 target_link_libraries(${PROJECT_NAME} PRIVATE
     glad
